@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 TOOLS = [
     {
-        "name": "get_schema"
+        "name": "get_schema",
         "description": (
             "Получить схему базы данных: список таблиц и их столбцов с типами. "
             "Вызывай ВСЕГДА перед первым SQL-запросом в новом диалоге, "
