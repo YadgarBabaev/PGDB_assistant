@@ -92,7 +92,7 @@ class ClaudeAgent:
     def __init__(self):
         self.client  = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self.db_url  = os.environ.get("DATABASE_URL")
-        self.model   = "claude-sonnet-4-20250514"
+        self.model   = "claude-sonnet-4-5-20250929"
 
     # ── Инструменты ──────────────────────────────────────────────────────────
 
