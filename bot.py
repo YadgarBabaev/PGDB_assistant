@@ -1,5 +1,5 @@
 """
-Telegram-бот с Claude + PostgreSQL
+Telegram-бот с Claude + PostgreSQL (мульти-БД)
 Запуск: python bot.py
 """
 
@@ -16,81 +16,150 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Загрузка конфига ────────────────────────────────────────────────────────
-
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 ALLOWED_USER_IDS = set(map(int, os.environ.get("ALLOWED_USER_IDS", "").split(",")))
 
+# Загружаем все базы из переменных окружения
+DATABASES: dict[int, dict] = {}
+db_names_raw = os.environ.get("DB_NAMES", "")
+db_names = [n.strip() for n in db_names_raw.split(",")] if db_names_raw else []
+
+i = 1
+while True:
+    url = os.environ.get(f"DATABASE_URL_{i}")
+    if not url:
+        break
+    DATABASES[i] = {
+        "url":  url,
+        "name": db_names[i - 1] if i - 1 < len(db_names) else f"DB {i}",
+    }
+    i += 1
+
+if not DATABASES:
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        DATABASES[1] = {"url": url, "name": db_names[0] if db_names else "DB 1"}
+
+logger.info("Loaded %d database(s): %s", len(DATABASES), {k: v["name"] for k, v in DATABASES.items()})
+
 agent = ClaudeAgent()
 
-# ─── Middleware: защита доступа ──────────────────────────────────────────────
+# ─── Состояние пользователей ─────────────────────────────────────────────────
+
+user_state: dict[int, dict] = {}
+
+def get_state(uid: int) -> dict:
+    if uid not in user_state:
+        user_state[uid] = {"db_index": 1, "history": []}
+    return user_state[uid]
+
+# ─── Middleware ───────────────────────────────────────────────────────────────
 
 def restricted(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         if ALLOWED_USER_IDS and uid not in ALLOWED_USER_IDS:
             await update.message.reply_text("⛔ Нет доступа.")
-            logger.warning("Blocked user_id=%s", uid)
             return
         return await func(update, ctx)
     return wrapper
-
-# ─── Хранилище истории диалогов (в памяти, на сессию) ────────────────────────
-
-conversation_history: dict[int, list] = {}
 
 # ─── Хендлеры ────────────────────────────────────────────────────────────────
 
 @restricted
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = get_state(uid)
+    current = DATABASES.get(state["db_index"], {}).get("name", "—")
+    db_list = "\n".join(f"  /db {k} — {v['name']}" for k, v in DATABASES.items())
+
     await update.message.reply_text(
-        "👋 Привет! Я Claude — умею работать с вашей PostgreSQL БД.\n\n"
-        "Примеры запросов:\n"
-        "• Покажи все таблицы\n"
-        "• Добавь пользователя Иван, email ivan@mail.ru\n"
-        "• Измени статус заказа #42 на 'выполнен'\n"
-        "• Удали запись с id=5 из таблицы logs\n\n"
-        "/clear — сбросить историю диалога"
+        f"👋 Привет! Я Claude — управляю вашими PostgreSQL базами.\n\n"
+        f"Текущая база: {current}\n\n"
+        f"Доступные базы:\n{db_list}\n\n"
+        f"Команды:\n"
+        f"/db <номер> — переключить базу\n"
+        f"/status — текущая база\n"
+        f"/clear — сбросить историю диалога"
+    )
+
+@restricted
+async def cmd_db(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = get_state(uid)
+    args = ctx.args
+
+    if not args:
+        db_list = "\n".join(f"  /db {k} — {v['name']}" for k, v in DATABASES.items())
+        current = DATABASES.get(state["db_index"], {}).get("name", "—")
+        await update.message.reply_text(f"Текущая: {current}\n\nДоступные:\n{db_list}")
+        return
+
+    try:
+        idx = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Использование: /db <номер>  например /db 2")
+        return
+
+    if idx not in DATABASES:
+        db_list = "\n".join(f"  {k} — {v['name']}" for k, v in DATABASES.items())
+        await update.message.reply_text(f"Нет базы с номером {idx}.\n\nДоступные:\n{db_list}")
+        return
+
+    state["db_index"] = idx
+    state["history"]  = []
+    name = DATABASES[idx]["name"]
+    await update.message.reply_text(f"✅ Переключено на {name}\nИстория диалога сброшена.")
+
+@restricted
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = get_state(uid)
+    db = DATABASES.get(state["db_index"], {})
+    await update.message.reply_text(
+        f"📊 Текущая база: {db.get('name', '—')} (#{state['db_index']})"
     )
 
 @restricted
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    conversation_history.pop(update.effective_user.id, None)
+    get_state(update.effective_user.id)["history"] = []
     await update.message.reply_text("🗑 История диалога очищена.")
 
 @restricted
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     text  = update.message.text
+    state = get_state(uid)
 
-    history = conversation_history.setdefault(uid, [])
+    db_url = DATABASES.get(state["db_index"], {}).get("url")
+    if not db_url:
+        await update.message.reply_text("⚠️ База не выбрана. Используй /db <номер>")
+        return
 
-    # Показываем "печатает..."
     await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
 
     try:
-        reply, history = await asyncio.to_thread(agent.chat, text, history)
-        conversation_history[uid] = history[-20:]  # храним последние 10 пар
+        reply, history = await asyncio.to_thread(
+            agent.chat, text, state["history"], db_url
+        )
+        state["history"] = history[-20:]
     except Exception as e:
         logger.exception("Agent error")
         reply = f"❌ Ошибка агента: {e}"
 
-    # Telegram не рендерит MD таблицы — шлём как обычный текст
     await update.message.reply_text(reply)
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("clear", cmd_clear))
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("db",     cmd_db))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot started. Allowed users: %s", ALLOWED_USER_IDS or "ALL")
+    logger.info("Bot started. DBs: %s", list(DATABASES.keys()))
     app.run_polling()
 
 if __name__ == "__main__":

@@ -177,11 +177,13 @@ class ClaudeAgent:
 
     # ── Основной цикл агента ─────────────────────────────────────────────────
 
-    def chat(self, user_message: str, history: list) -> tuple[str, list]:
+    def chat(self, user_message: str, history: list, db_url: str | None = None) -> tuple[str, list]:
         """
-        Принимает сообщение и историю, возвращает (ответ_текст, новая_история).
-        Запускает agentic loop: Claude → tool call → result → Claude → ...
+        Принимает сообщение, историю и опциональный db_url (для мульти-БД).
+        Возвращает (ответ_текст, новая_история).
         """
+        if db_url:
+            self.db_url = db_url
         history = history + [{"role": "user", "content": user_message}]
 
         while True:
