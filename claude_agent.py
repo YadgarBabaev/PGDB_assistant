@@ -74,58 +74,102 @@ TOOLS = [
 
 # ─── Системный промпт ─────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Ты — ассистент для работы с PostgreSQL базой данных.
+SYSTEM_PROMPT = """Ты — ассистент для работы с PostgreSQL базой данных. Работаешь на модели claude-sonnet-4-5-20250929.
 
-Правила:
-1. Перед первым запросом в диалоге вызови get_schema, чтобы знать структуру БД.
-2. Всегда используй параметризованные значения в SQL — никакого SQL-инъекционного кода.
-3. Перед INSERT/UPDATE/DELETE кратко опиши пользователю, что именно изменишь.
-4. Возвращай результаты в читаемом виде (таблица как текст или список).
-5. Если запрос неоднозначен — уточни, прежде чем выполнять.
-6. Никогда не выполняй DROP TABLE / TRUNCATE / DROP DATABASE без явного подтверждения.
-7. Отвечай на том же языке, на котором пишет пользователь.
+АЛГОРИТМ ОБРАБОТКИ ЗАПРОСА:
+
+Если пользователь прислал готовый SQL-запрос — сразу переходи к выполнению (шаг 4).
+
+Иначе:
+1. УТОЧНЕНИЕ: если в запросе есть что-то неоднозначное или непонятное — задай уточняющий вопрос. Не угадывай.
+2. ПОКАЗ ЗАПРОСА: если всё понятно — покажи сгенерированный SQL. Жди подтверждения.
+3. ПОДТВЕРЖДЕНИЕ: пользователь подтверждает (текстом или реакцией/эмодзи) или корректирует.
+4. ВЫПОЛНЕНИЕ: запускай SQL и возвращай результат.
+
+ФОРМАТ ОТВЕТА:
+- Данные сразу, без вступлений типа "Выполнено, получено N строк из таблицы X"
+- Никаких описаний структуры таблиц в ответе если пользователь не просил
+- Данные выводи максимально читаемо: выравнивай колонки, используй разделители
+- Если строк много — спроси нужно ли больше
+
+ЖЁСТКИЕ ЗАПРЕТЫ:
+- НИКОГДА не выполняй DROP TABLE, DROP DATABASE, TRUNCATE — без исключений
+- DROP FUNCTION — только после явного текстового подтверждения от пользователя, не по реакции/эмодзи
+- Не делай SQL-инъекции, всегда используй параметризованные запросы
+
+ПРОЧЕЕ:
+- Перед первым запросом в новом диалоге вызови get_schema
+- Отвечай на том же языке, на котором пишет пользователь
 """
 
 # ─── Агент ───────────────────────────────────────────────────────────────────
 
 class ClaudeAgent:
     def __init__(self):
-        self.client  = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        self.db_url  = os.environ.get("DATABASE_URL")
-        self.model   = "claude-sonnet-4-5-20250929"
+        self.client   = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self.db_url   = os.environ.get("DATABASE_URL")
+        self.schemas  = ["public"]
+        self.model    = "claude-sonnet-4-5-20250929"
 
-    # ── Инструменты ──────────────────────────────────────────────────────────
+    # ── Очистка истории от осиротевших tool_result ────────────────────────────
+
+    @staticmethod
+    def _sanitize_history(history: list) -> list:
+        """Убирает tool_result блоки без соответствующего tool_use в предыдущем сообщении."""
+        clean = []
+        for i, msg in enumerate(history):
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                # Собираем tool_use id из предыдущего assistant-сообщения
+                valid_ids = set()
+                if clean and clean[-1]["role"] == "assistant":
+                    prev = clean[-1]["content"]
+                    if isinstance(prev, list):
+                        valid_ids = {b.id for b in prev if hasattr(b, "type") and b.type == "tool_use"}
+                    elif isinstance(prev, str):
+                        valid_ids = set()
+
+                filtered = [
+                    b for b in msg["content"]
+                    if not (isinstance(b, dict) and b.get("type") == "tool_result")
+                    or b.get("tool_use_id") in valid_ids
+                ]
+                if filtered:
+                    clean.append({**msg, "content": filtered})
+            else:
+                clean.append(msg)
+        return clean
 
     def _get_conn(self):
         return psycopg2.connect(self.db_url)
 
     def tool_get_schema(self, table_name: str | None = None) -> str:
-        sql = """
+        schemas_placeholder = ",".join(["%s"] * len(self.schemas))
+        sql = f"""
             SELECT
+                c.table_schema,
                 c.table_name,
                 c.column_name,
                 c.data_type,
                 c.is_nullable,
                 c.column_default
             FROM information_schema.columns c
-            WHERE c.table_schema = 'public'
-            {filter}
-            ORDER BY c.table_name, c.ordinal_position
-        """.format(
-            filter=f"AND c.table_name = %s" if table_name else ""
-        )
+            WHERE c.table_schema IN ({schemas_placeholder})
+            {"AND c.table_name = %s" if table_name else ""}
+            ORDER BY c.table_schema, c.table_name, c.ordinal_position
+        """
+        params = list(self.schemas) + ([table_name] if table_name else [])
 
         with self._get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (table_name,) if table_name else ())
+            cur.execute(sql, params)
             rows = cur.fetchall()
 
         if not rows:
-            return "Таблицы не найдены." if table_name else "БД пуста (нет таблиц в схеме public)."
+            return "Таблицы не найдены."
 
-        # Группируем по таблице
         tables: dict[str, list] = {}
         for r in rows:
-            tables.setdefault(r["table_name"], []).append(r)
+            key = f"{r['table_schema']}.{r['table_name']}"
+            tables.setdefault(key, []).append(r)
 
         lines = []
         for tname, cols in tables.items():
@@ -159,14 +203,17 @@ class ClaudeAgent:
     def tool_execute_mutation(self, sql: str, confirm_message: str) -> str:
         clean = sql.strip().upper()
 
-        # Запрещаем деструктивные DDL без явного слова CONFIRM в confirm_message
-        danger = ("DROP TABLE", "TRUNCATE", "DROP DATABASE", "DROP SCHEMA")
-        if any(d in clean for d in danger):
-            if "ПОДТВЕРЖДАЮ" not in confirm_message.upper():
-                return (
-                    "⚠️ Опасная операция! Для выполнения пользователь должен явно "
-                    "написать ПОДТВЕРЖДАЮ в запросе."
-                )
+        # Безусловный запрет
+        hard_block = ("DROP TABLE", "TRUNCATE", "DROP DATABASE", "DROP SCHEMA")
+        if any(d in clean for d in hard_block):
+            return "⛔ Операция запрещена. DROP TABLE, DROP DATABASE, DROP SCHEMA и TRUNCATE не выполняются никогда."
+
+        # DROP FUNCTION — только с явным подтверждением
+        if "DROP FUNCTION" in clean and "ПОДТВЕРЖДАЮ" not in confirm_message.upper():
+            return (
+                "⚠️ DROP FUNCTION — опасная операция. "
+                "Напиши явно ПОДТВЕРЖДАЮ чтобы выполнить."
+            )
 
         with self._get_conn() as conn, conn.cursor() as cur:
             cur.execute(sql)
@@ -177,13 +224,16 @@ class ClaudeAgent:
 
     # ── Основной цикл агента ─────────────────────────────────────────────────
 
-    def chat(self, user_message: str, history: list, db_url: str | None = None) -> tuple[str, list]:
+    def chat(self, user_message: str, history: list, db_url: str | None = None, schemas: list | None = None) -> tuple[str, list]:
         """
-        Принимает сообщение, историю и опциональный db_url (для мульти-БД).
+        Принимает сообщение, историю, опциональный db_url и список схем.
         Возвращает (ответ_текст, новая_история).
         """
         if db_url:
             self.db_url = db_url
+        if schemas:
+            self.schemas = schemas
+        history = self._sanitize_history(history)
         history = history + [{"role": "user", "content": user_message}]
 
         while True:
