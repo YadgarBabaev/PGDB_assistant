@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 TOOLS = [
     {
-        "name": "get_schema",
+        "name": "get_schema"
         "description": (
             "Получить схему базы данных: список таблиц и их столбцов с типами. "
             "Вызывай ВСЕГДА перед первым SQL-запросом в новом диалоге, "
@@ -91,7 +91,7 @@ SYSTEM_PROMPT = """Ты — ассистент для работы с PostgreSQL
 class ClaudeAgent:
     def __init__(self):
         self.client  = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        self.db_url  = os.environ["DATABASE_URL"]
+        self.db_url  = os.environ.get("DATABASE_URL")
         self.model   = "claude-sonnet-4-20250514"
 
     # ── Инструменты ──────────────────────────────────────────────────────────
