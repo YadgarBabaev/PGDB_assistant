@@ -334,6 +334,7 @@ class ClaudeAgent:
         if schemas:
             self.schemas = schemas
         self._pending_file = None
+        last_tool_result = ""
         history = self._sanitize_history(history)
         history = history + [{"role": "user", "content": user_message}]
 
@@ -353,7 +354,10 @@ class ClaudeAgent:
             if response.stop_reason == "end_turn":
                 text = " ".join(
                     block.text for block in response.content if hasattr(block, "text")
-                )
+                ).strip()
+                # Если текст пустой и нет файла — отдаём последний результат инструмента
+                if not text and not self._pending_file:
+                    text = last_tool_result or "⚠️ Агент не вернул ответ. Попробуй /clear."
                 return text, history, self._pending_file
 
             # Иначе — обрабатываем tool calls
@@ -368,6 +372,7 @@ class ClaudeAgent:
                 logger.info("Tool call: %s(%s)", block.name, block.input)
                 result = self._dispatch_tool(block.name, block.input)
                 logger.info("Tool result: %s", result[:200])
+                last_tool_result = result  # сохраняем последний результат
 
                 tool_results.append({
                     "type": "tool_result",
