@@ -252,7 +252,7 @@ class ClaudeAgent:
             return "⛔ export_data допускает только SELECT / WITH."
 
         with self._get_conn() as conn:
-            df = pd.read_sql_query(sql, conn)
+            df = pd.read_sql_query(sql, conn.cursor().connection)
 
         if df.empty:
             return "Запрос вернул пустой результат — файл не создан."

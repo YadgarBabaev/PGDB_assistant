@@ -164,13 +164,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         import io as _io
         buf = _io.BytesIO(pending_file["data"])
         buf.name = pending_file["filename"]
-        if pending_file["mimetype"] == "image/png":
-            await update.message.reply_photo(photo=buf)
-        else:
-            await update.message.reply_document(document=buf, filename=pending_file["filename"])
+        # Всегда отправляем как документ — избегаем ограничений Telegram на размер фото
+        await update.message.reply_document(document=buf, filename=pending_file["filename"])
 
+    # Отправляем текст всегда, кроме служебного маркера __FILE__
     if reply and not reply.startswith("__FILE__"):
         await update.message.reply_text(reply)
+    elif not pending_file:
+        await update.message.reply_text("⚠️ Нет ответа от агента. Попробуй /clear и повтори.")
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
