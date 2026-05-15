@@ -117,10 +117,10 @@ SYSTEM_PROMPT = """Ты — ассистент для работы с PostgreSQL
 - Не придумывай фильтры если пользователь их не просил
 
 ФОРМАТ ОТВЕТА:
-- Сразу показывай данные — никаких "Показано N строк", "База загружена", описаний таблиц
-- Не представляйся, не описывай БД, не задавай вопросы после выполнения SELECT
-- Если данных много — просто покажи первые 50 без комментариев
-- export_data используй только если пользователь явно просит выгрузку/файл/excel/картинку. По умолчанию format=excel
+- Для получения данных всегда используй execute_query — он сам решит показать в чате или файлом
+- export_data используй только если пользователь явно просит конкретный формат (excel/картинка)
+- Никаких "Показано N строк", "База загружена", описаний таблиц
+- Не представляйся, не описывай БД, не задавай вопросы после выполнения запроса
 
 ЖЁСТКИЕ ЗАПРЕТЫ:
 - НИКОГДА не выполняй DROP TABLE, DROP DATABASE, TRUNCATE
@@ -211,12 +211,10 @@ class ClaudeAgent:
         return "\n".join(lines)
 
     def tool_execute_query(self, sql: str, limit: int = 50) -> str:
-        # Защита: только SELECT
         clean = sql.strip().upper()
         if not clean.startswith("SELECT") and not clean.startswith("WITH"):
             return "⛔ execute_query допускает только SELECT / WITH."
 
-        # Добавляем LIMIT если нет
         if "LIMIT" not in clean:
             sql = f"{sql.rstrip(';')} LIMIT {limit}"
 
@@ -225,7 +223,24 @@ class ClaudeAgent:
             rows = cur.fetchall()
 
         if not rows:
-            return "Запрос выполнен. Строк не найдено."
+            return "Строк не найдено."
+
+        n_rows = len(rows)
+        n_cols = len(rows[0].keys())
+
+        # Если данных много — автоматически делаем Excel
+        if n_rows >= 10 or n_cols >= 5:
+            df = pd.DataFrame([dict(r) for r in rows])
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Data")
+            buf.seek(0)
+            self._pending_file = {
+                "data":     buf.read(),
+                "filename": "result.xlsx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }
+            return f"__FILE__:result.xlsx:{n_rows} строк, {n_cols} колонок"
 
         return _rows_to_text(rows)
 
