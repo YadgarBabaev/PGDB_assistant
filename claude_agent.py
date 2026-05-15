@@ -38,7 +38,8 @@ TOOLS = [
         "name": "execute_query",
         "description": (
             "Выполнить SELECT-запрос и вернуть результат. "
-            "Используй только для чтения данных."
+            "Используй только для чтения данных. "
+            "Если пользователь просит текстом/в чате — передавай force_text=true."
         ),
         "input_schema": {
             "type": "object",
@@ -48,6 +49,11 @@ TOOLS = [
                     "type": "integer",
                     "description": "Максимум строк (по умолчанию 50)",
                     "default": 50,
+                },
+                "force_text": {
+                    "type": "boolean",
+                    "description": "Если true — вернуть текстом в чате, даже если данных много",
+                    "default": False,
                 },
             },
             "required": ["sql"],
@@ -210,7 +216,7 @@ class ClaudeAgent:
 
         return "\n".join(lines)
 
-    def tool_execute_query(self, sql: str, limit: int = 50) -> str:
+    def tool_execute_query(self, sql: str, limit: int = 50, force_text: bool = False) -> str:
         clean = sql.strip().upper()
         if not clean.startswith("SELECT") and not clean.startswith("WITH"):
             return "⛔ execute_query допускает только SELECT / WITH."
@@ -228,8 +234,8 @@ class ClaudeAgent:
         n_rows = len(rows)
         n_cols = len(rows[0].keys())
 
-        # Если данных много — автоматически делаем Excel
-        if n_rows >= 10 or n_cols >= 5:
+        # Автоматически Excel если данных много — если только не просят текстом
+        if not force_text and (n_rows >= 10 or n_cols >= 5):
             df = pd.DataFrame([dict(r) for r in rows])
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -405,7 +411,7 @@ class ClaudeAgent:
             if name == "get_schema":
                 return self.tool_get_schema(inputs.get("table_name"))
             elif name == "execute_query":
-                return self.tool_execute_query(inputs["sql"], inputs.get("limit", 50))
+                return self.tool_execute_query(inputs["sql"], inputs.get("limit", 50), inputs.get("force_text", False))
             elif name == "execute_mutation":
                 return self.tool_execute_mutation(inputs["sql"], inputs["confirm_message"])
             elif name == "export_data":
