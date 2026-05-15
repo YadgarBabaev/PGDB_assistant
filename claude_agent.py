@@ -4,10 +4,11 @@ Claude-агент с инструментами для работы с PostgreSQ
 """
 
 import os
-import json
+import io
 import logging
 import psycopg2
 import psycopg2.extras
+import pandas as pd
 from anthropic import Anthropic
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,29 @@ TOOLS = [
             "required": ["sql", "confirm_message"],
         },
     },
+    {
+        "name": "export_data",
+        "description": (
+            "Выполнить SELECT и вернуть результат в виде файла. "
+            "Используй когда пользователь просит выгрузить данные в Excel или картинкой/изображением."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "SELECT-запрос"},
+                "format": {
+                    "type": "string",
+                    "enum": ["excel", "image"],
+                    "description": "Формат: excel (.xlsx) или image (PNG)",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Имя файла без расширения, например 'players'",
+                },
+            },
+            "required": ["sql", "format"],
+        },
+    },
 ]
 
 # ─── Системный промпт ─────────────────────────────────────────────────────────
@@ -99,7 +123,6 @@ SYSTEM_PROMPT = """Ты — ассистент для работы с PostgreSQL
 
 ПРОЧЕЕ:
 - Перед первым запросом в новом диалоге вызови get_schema
-- Отвечай на том же языке, на котором пишет пользователь
 """
 
 # ─── Агент ───────────────────────────────────────────────────────────────────
@@ -110,6 +133,7 @@ class ClaudeAgent:
         self.db_url   = os.environ.get("DATABASE_URL")
         self.schemas  = ["public"]
         self.model    = "claude-sonnet-4-5-20250929"
+        self._pending_file: dict | None = None
 
     # ── Очистка истории от осиротевших tool_result ────────────────────────────
 
@@ -222,6 +246,77 @@ class ClaudeAgent:
 
         return f"✅ {confirm_message}\nЗатронуто строк: {affected}"
 
+    def tool_export_data(self, sql: str, format: str, filename: str | None = None) -> str | bytes:
+        clean = sql.strip().upper()
+        if not clean.startswith("SELECT") and not clean.startswith("WITH"):
+            return "⛔ export_data допускает только SELECT / WITH."
+
+        with self._get_conn() as conn:
+            df = pd.read_sql_query(sql, conn)
+
+        if df.empty:
+            return "Запрос вернул пустой результат — файл не создан."
+
+        name = filename or "export"
+
+        if format == "excel":
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Data")
+            buf.seek(0)
+            # Возвращаем метаданные — бот сам отправит файл
+            self._pending_file = {
+                "data":     buf.read(),
+                "filename": f"{name}.xlsx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }
+            return f"__FILE__:{name}.xlsx:{len(df)} строк, {len(df.columns)} колонок"
+
+        elif format == "image":
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            # Ограничиваем для читабельности
+            preview = df.head(50)
+            fig, ax = plt.subplots(figsize=(max(8, len(df.columns) * 1.5), max(4, len(preview) * 0.4 + 1.5)))
+            ax.axis("off")
+            tbl = ax.table(
+                cellText=preview.values.tolist(),
+                colLabels=df.columns.tolist(),
+                cellLoc="center",
+                loc="center",
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(9)
+            tbl.auto_set_column_width(col=list(range(len(df.columns))))
+
+            # Заголовок — серый фон
+            for j in range(len(df.columns)):
+                tbl[0, j].set_facecolor("#4472C4")
+                tbl[0, j].set_text_props(color="white", fontweight="bold")
+
+            # Зебра
+            for i in range(1, len(preview) + 1):
+                for j in range(len(df.columns)):
+                    tbl[i, j].set_facecolor("#EEF2FF" if i % 2 == 0 else "white")
+
+            plt.tight_layout()
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            buf.seek(0)
+
+            suffix = f" (показано 50 из {len(df)})" if len(df) > 50 else ""
+            self._pending_file = {
+                "data":     buf.read(),
+                "filename": f"{name}.png",
+                "mimetype": "image/png",
+            }
+            return f"__FILE__:{name}.png:{len(df)} строк{suffix}"
+
+        return f"Неизвестный формат: {format}"
+
     # ── Основной цикл агента ─────────────────────────────────────────────────
 
     def chat(self, user_message: str, history: list, db_url: str | None = None, schemas: list | None = None) -> tuple[str, list]:
@@ -233,6 +328,7 @@ class ClaudeAgent:
             self.db_url = db_url
         if schemas:
             self.schemas = schemas
+        self._pending_file = None
         history = self._sanitize_history(history)
         history = history + [{"role": "user", "content": user_message}]
 
@@ -253,7 +349,7 @@ class ClaudeAgent:
                 text = " ".join(
                     block.text for block in response.content if hasattr(block, "text")
                 )
-                return text, history
+                return text, history, self._pending_file
 
             # Иначе — обрабатываем tool calls
             if response.stop_reason != "tool_use":
@@ -277,7 +373,7 @@ class ClaudeAgent:
             history.append({"role": "user", "content": tool_results})
 
         # На всякий случай
-        return "Что-то пошло не так.", history
+        return "Что-то пошло не так.", history, None
 
     def _dispatch_tool(self, name: str, inputs: dict) -> str:
         try:
@@ -287,6 +383,8 @@ class ClaudeAgent:
                 return self.tool_execute_query(inputs["sql"], inputs.get("limit", 50))
             elif name == "execute_mutation":
                 return self.tool_execute_mutation(inputs["sql"], inputs["confirm_message"])
+            elif name == "export_data":
+                return self.tool_export_data(inputs["sql"], inputs["format"], inputs.get("filename"))
             else:
                 return f"Неизвестный инструмент: {name}"
         except psycopg2.Error as e:

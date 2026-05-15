@@ -29,16 +29,25 @@ while True:
     url = os.environ.get(f"DATABASE_URL_{i}")
     if not url:
         break
+    schemas_raw = os.environ.get(f"DB_SCHEMAS_{i}", "public")
+    schemas = [s.strip() for s in schemas_raw.split(",")]
     DATABASES[i] = {
-        "url":  url,
-        "name": db_names[i - 1] if i - 1 < len(db_names) else f"DB {i}",
+        "url":     url,
+        "name":    db_names[i - 1] if i - 1 < len(db_names) else f"DB {i}",
+        "schemas": schemas,
     }
     i += 1
 
 if not DATABASES:
     url = os.environ.get("DATABASE_URL")
     if url:
-        DATABASES[1] = {"url": url, "name": db_names[0] if db_names else "DB 1"}
+        schemas_raw = os.environ.get("DB_SCHEMAS_1", "public")
+        schemas = [s.strip() for s in schemas_raw.split(",")]
+        DATABASES[1] = {
+            "url":     url,
+            "name":    db_names[0] if db_names else "DB 1",
+            "schemas": schemas,
+        }
 
 logger.info("Loaded %d database(s): %s", len(DATABASES), {k: v["name"] for k, v in DATABASES.items()})
 
@@ -131,7 +140,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text
     state = get_state(uid)
 
-    db_url = DATABASES.get(state["db_index"], {}).get("url")
+    db = DATABASES.get(state["db_index"], {})
+    db_url     = db.get("url")
+    db_schemas = db.get("schemas", ["public"])
     if not db_url:
         await update.message.reply_text("⚠️ База не выбрана. Используй /db <номер>")
         return
@@ -139,15 +150,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
 
     try:
-        reply, history = await asyncio.to_thread(
-            agent.chat, text, state["history"], db_url
+        reply, history, pending_file = await asyncio.to_thread(
+            agent.chat, text, state["history"], db_url, db_schemas
         )
         state["history"] = history[-20:]
     except Exception as e:
         logger.exception("Agent error")
         reply = f"❌ Ошибка агента: {e}"
+        pending_file = None
 
-    await update.message.reply_text(reply)
+    # Отправляем файл если есть
+    if pending_file:
+        import io as _io
+        buf = _io.BytesIO(pending_file["data"])
+        buf.name = pending_file["filename"]
+        if pending_file["mimetype"] == "image/png":
+            await update.message.reply_photo(photo=buf)
+        else:
+            await update.message.reply_document(document=buf, filename=pending_file["filename"])
+
+    if reply and not reply.startswith("__FILE__"):
+        await update.message.reply_text(reply)
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
