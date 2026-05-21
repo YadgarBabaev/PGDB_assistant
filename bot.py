@@ -146,6 +146,9 @@ async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🧠 Память о тебе:\n\n{user_memory}")
     else:
         await update.message.reply_text("🧠 Память пока пуста — накопится после нескольких диалогов.")
+
+@restricted
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     text  = update.message.text
     state = get_state(uid)
