@@ -345,10 +345,10 @@ class ClaudeAgent:
 
     # ── Основной цикл агента ─────────────────────────────────────────────────
 
-    def chat(self, user_message: str, history: list, db_url: str | None = None, schemas: list | None = None) -> tuple[str, list]:
+    def chat(self, user_message: str, history: list, db_url: str | None = None, schemas: list | None = None, memory: str = "") -> tuple[str, list, dict | None]:
         """
-        Принимает сообщение, историю, опциональный db_url и список схем.
-        Возвращает (ответ_текст, новая_история).
+        Принимает сообщение, историю, опциональный db_url, список схем и память пользователя.
+        Возвращает (ответ_текст, новая_история, pending_file).
         """
         if db_url:
             self.db_url = db_url
@@ -359,11 +359,15 @@ class ClaudeAgent:
         history = self._sanitize_history(history)
         history = history + [{"role": "user", "content": user_message}]
 
+        system = SYSTEM_PROMPT
+        if memory:
+            system += f"\nПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ:\n{memory}\n"
+
         while True:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=2048,
-                system=SYSTEM_PROMPT,
+                system=system,
                 tools=TOOLS,
                 messages=history,
             )

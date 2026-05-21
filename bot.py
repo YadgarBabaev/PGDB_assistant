@@ -9,6 +9,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from claude_agent import ClaudeAgent
+from memory import MemoryManager
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -51,7 +52,8 @@ if not DATABASES:
 
 logger.info("Loaded %d database(s): %s", len(DATABASES), {k: v["name"] for k, v in DATABASES.items()})
 
-agent = ClaudeAgent()
+agent  = ClaudeAgent()
+memory = MemoryManager()
 
 # ─── Состояние пользователей ─────────────────────────────────────────────────
 
@@ -131,11 +133,19 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    get_state(update.effective_user.id)["history"] = []
-    await update.message.reply_text("🗑 История диалога очищена.")
+    uid = update.effective_user.id
+    get_state(uid)["history"] = []
+    memory.clear(uid)
+    await update.message.reply_text("🗑 История диалога очищена. Память сохранена.")
 
 @restricted
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user_memory = await asyncio.to_thread(memory.load, uid)
+    if user_memory:
+        await update.message.reply_text(f"🧠 Память о тебе:\n\n{user_memory}")
+    else:
+        await update.message.reply_text("🧠 Память пока пуста — накопится после нескольких диалогов.")
     uid   = update.effective_user.id
     text  = update.message.text
     state = get_state(uid)
@@ -149,15 +159,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await ctx.bot.send_chat_action(update.effective_chat.id, "typing")
 
+    # Загружаем память пользователя
+    user_memory = await asyncio.to_thread(memory.load, uid)
+
     try:
         reply, history, pending_file = await asyncio.to_thread(
-            agent.chat, text, state["history"], db_url, db_schemas
+            agent.chat, text, state["history"], db_url, db_schemas, user_memory
         )
         state["history"] = history[-20:]
     except Exception as e:
         logger.exception("Agent error")
         reply = f"❌ Ошибка агента: {e}"
         pending_file = None
+
+    # Обновляем память каждые N сообщений (в фоне)
+    should_update = await asyncio.to_thread(memory.increment_and_check, uid)
+    if should_update:
+        asyncio.create_task(asyncio.to_thread(
+            memory.update, uid, state["history"], user_memory
+        ))
 
     # Отправляем файл если есть
     if pending_file:
@@ -181,6 +201,7 @@ def main():
     app.add_handler(CommandHandler("db",     cmd_db))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started. DBs: %s", list(DATABASES.keys()))
